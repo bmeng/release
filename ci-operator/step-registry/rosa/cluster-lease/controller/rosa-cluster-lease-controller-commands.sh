@@ -99,6 +99,9 @@ metadata:
     rosa-cluster-lease/acquired-at: ""
     rosa-cluster-lease/released-at: ""
     rosa-cluster-lease/registered-at: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    rosa-cluster-lease/health-status: "unknown"
+    rosa-cluster-lease/health-reason: "Health check pending"
+    rosa-cluster-lease/health-checked-at: ""
 data:
   cluster-id: "${cluster_id}"
   cluster-name: "${name}"
@@ -609,9 +612,9 @@ while IFS= read -r cluster_json; do
 done < <(echo "${DESIRED_NAMES}")
 
 # ---------------------------------------------------------------
-# Phase 4: Health check existing clusters
+# Phase 4: Reconcile lease lifecycle and published health state
 # ---------------------------------------------------------------
-log "Phase 4: Health checking existing clusters"
+log "Phase 4: Reconciling lease lifecycle and health state"
 
 # Re-read actual state (may have changed from provisioning)
 ACTUAL_CMS=$(lease_oc get configmap -n "${LEASE_NAMESPACE}" -l "rosa-cluster-lease/managed=true" -o json 2>/dev/null || echo '{"items":[]}')
@@ -628,6 +631,9 @@ for i in $(seq 0 $((ACTUAL_COUNT - 1))); do
     STATUS=$(echo "${CM}" | jq -r '.metadata.labels["rosa-cluster-lease/status"]')
     HOLDER=$(echo "${CM}" | jq -r '.metadata.annotations["rosa-cluster-lease/holder"] // ""')
     ACQUIRED_AT=$(echo "${CM}" | jq -r '.metadata.annotations["rosa-cluster-lease/acquired-at"] // ""')
+    HEALTH_STATUS=$(echo "${CM}" | jq -r '.metadata.annotations["rosa-cluster-lease/health-status"] // "unknown"')
+    HEALTH_REASON=$(echo "${CM}" | jq -r '.metadata.annotations["rosa-cluster-lease/health-reason"] // ""')
+    HEALTH_CHECKED_AT=$(echo "${CM}" | jq -r '.metadata.annotations["rosa-cluster-lease/health-checked-at"] // ""')
 
     # Stale lease recovery (per-operator and legacy)
     if [[ "${STATUS}" == "in-use" ]]; then
@@ -657,12 +663,16 @@ for i in $(seq 0 $((ACTUAL_COUNT - 1))); do
                     # All operators stale, release the whole cluster
                     if ! dry_run_guard "Would release all stale operators on ${CM_NAME}"; then
                         RECOVERED_CM=$(echo "${CM}" | jq '
-                            .metadata.labels["rosa-cluster-lease/status"] = "available" |
+                            .metadata.labels["rosa-cluster-lease/status"] = "error" |
                             .metadata.annotations["rosa-cluster-lease/operators"] = "" |
                             .metadata.annotations["rosa-cluster-lease/holder"] = "" |
                             .metadata.annotations["rosa-cluster-lease/build-id"] = "" |
                             .metadata.annotations["rosa-cluster-lease/released-at"] = "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'" |
-                            .metadata.annotations["rosa-cluster-lease/recovered-by"] = "controller"
+                            .metadata.annotations["rosa-cluster-lease/recovered-by"] = "controller" |
+                            .metadata.annotations["rosa-cluster-lease/health-status"] = "unknown" |
+                            .metadata.annotations["rosa-cluster-lease/health-reason"] = "Pending health check after stale lease recovery" |
+                            .metadata.annotations["rosa-cluster-lease/error-reason"] = "Health: pending after stale lease recovery" |
+                            .metadata.annotations["rosa-cluster-lease/error-at"] = "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
                         ')
                         echo "${RECOVERED_CM}" | lease_oc replace -n "${LEASE_NAMESPACE}" -f - || true
                     fi
@@ -694,12 +704,16 @@ for i in $(seq 0 $((ACTUAL_COUNT - 1))); do
                 if ! dry_run_guard "Would release stale lease on ${CM_NAME}"; then
                     lease_oc patch configmap "${CM_NAME}" -n "${LEASE_NAMESPACE}" --type merge -p '{
                         "metadata": {
-                            "labels": { "rosa-cluster-lease/status": "available" },
+                            "labels": { "rosa-cluster-lease/status": "error" },
                             "annotations": {
                                 "rosa-cluster-lease/holder": "",
                                 "rosa-cluster-lease/build-id": "",
                                 "rosa-cluster-lease/released-at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'",
-                                "rosa-cluster-lease/recovered-by": "controller"
+                                "rosa-cluster-lease/recovered-by": "controller",
+                                "rosa-cluster-lease/health-status": "unknown",
+                                "rosa-cluster-lease/health-reason": "Pending health check after stale lease recovery",
+                                "rosa-cluster-lease/error-reason": "Health: pending after stale lease recovery",
+                                "rosa-cluster-lease/error-at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
                             }
                         }
                     }' || true
@@ -711,19 +725,11 @@ for i in $(seq 0 $((ACTUAL_COUNT - 1))); do
         fi
     fi
 
-    # Check OCM health for in-use clusters (report only, no action while job is running)
+    # Active claims are owned by checkout/checkin. The health job skips them so
+    # it never performs repairs while an operator test is running.
     if [[ "${STATUS}" == "in-use" ]]; then
-        ocm_check_cluster "${CLUSTER_ID}" "$(echo "${CM}" | jq -r '.data["ocm-env"] // "staging"')"
-        if [[ "${OCM_CHECK_RESULT}" == "unreachable" ]]; then
-            echo "IN-USE: ${CM_NAME} by ${HOLDER} (OCM unreachable)" >> "${REPORT}"
-        elif [[ "${OCM_CHECK_RESULT}" == "not-found" || "${OCM_CHECK_STATUS}" != "ready" ]]; then
-            log "WARNING: ${CM_NAME} in-use by ${HOLDER} but OCM status is ${OCM_CHECK_RESULT}/${OCM_CHECK_STATUS}"
-            UNHEALTHY=$((UNHEALTHY + 1))
-            echo "IN-USE WARNING: ${CM_NAME} by ${HOLDER} (OCM: ${OCM_CHECK_STATUS:-${OCM_CHECK_RESULT}})" >> "${REPORT}"
-        else
-            HEALTHY=$((HEALTHY + 1))
-            echo "IN-USE: ${CM_NAME} by ${HOLDER} (OCM: ${OCM_CHECK_STATUS})" >> "${REPORT}"
-        fi
+        HEALTHY=$((HEALTHY + 1))
+        echo "IN-USE: ${CM_NAME} by ${HOLDER}" >> "${REPORT}"
         continue
     fi
 
@@ -792,192 +798,46 @@ for i in $(seq 0 $((ACTUAL_COUNT - 1))); do
         continue
     fi
 
-    # Check OCM cluster status (available/error clusters)
-    ocm_check_cluster "${CLUSTER_ID}" "$(echo "${CM}" | jq -r '.data["ocm-env"] // "staging"')"
-
-    if [[ "${OCM_CHECK_RESULT}" == "unreachable" ]]; then
-        log "WARNING: ${CM_NAME} OCM unreachable (connectivity issue), skipping health check"
-        echo "SKIPPED: ${CM_NAME} (OCM unreachable)" >> "${REPORT}"
-        continue
-    fi
-
-    if [[ "${OCM_CHECK_RESULT}" == "not-found" ]]; then
-        log "UNHEALTHY: ${CM_NAME} no longer exists in OCM (deleted or expired)"
-        if [[ "${STATUS}" != "error" ]] && ! dry_run_guard "Would mark ${CM_NAME} as error"; then
-            lease_oc patch configmap "${CM_NAME}" -n "${LEASE_NAMESPACE}" --type merge -p '{
-                "metadata": {
-                    "labels": { "rosa-cluster-lease/status": "error" },
-                    "annotations": { "rosa-cluster-lease/error-reason": "Cluster deleted from OCM", "rosa-cluster-lease/error-at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'" }
-                }
-            }' || true
-        fi
-        UNHEALTHY=$((UNHEALTHY + 1))
-        echo "UNHEALTHY: ${CM_NAME} (deleted from OCM)" >> "${REPORT}"
-        continue
-    fi
-
-    if [[ "${OCM_CHECK_STATUS}" != "ready" ]]; then
-        log "UNHEALTHY: ${CM_NAME} OCM status is ${OCM_CHECK_STATUS}"
-        if [[ "${STATUS}" != "error" ]] && ! dry_run_guard "Would mark ${CM_NAME} as error"; then
-            lease_oc patch configmap "${CM_NAME}" -n "${LEASE_NAMESPACE}" --type merge -p '{
-                "metadata": {
-                    "labels": { "rosa-cluster-lease/status": "error" },
-                    "annotations": { "rosa-cluster-lease/error-reason": "OCM status: '"${OCM_CHECK_STATUS}"'", "rosa-cluster-lease/error-at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'" }
-                }
-            }' || true
-        fi
-        UNHEALTHY=$((UNHEALTHY + 1))
-        echo "UNHEALTHY: ${CM_NAME} (OCM: ${OCM_CHECK_STATUS})" >> "${REPORT}"
-        continue
-    fi
-
-    # RBAC smoke test: verify dedicated-admins group permissions are propagated.
-    # This catches broken rbac-permissions-operator before clusters are leased,
-    # preventing e2e test timeouts waiting for permissions that never arrive.
-    RBAC_KUBECONFIG=$(mktemp)
-    trap 'rm -f "${RBAC_KUBECONFIG}"' EXIT
-    RBAC_CHECK_FAILED=false
-    if ocm get "/api/clusters_mgmt/v1/clusters/${CLUSTER_ID}/credentials" 2>/dev/null \
-        | jq -r '.kubeconfig // empty' > "${RBAC_KUBECONFIG}" 2>/dev/null \
-        && [[ -s "${RBAC_KUBECONFIG}" ]]; then
-        RBAC_RESULT=$(oc auth can-i create configmaps \
-            --as=dedicated-admin-check --as-group=dedicated-admins \
-            -n dedicated-admin \
-            --request-timeout=30s \
-            --kubeconfig="${RBAC_KUBECONFIG}" 2>&1) || true
-        if [[ "${RBAC_RESULT}" == "no" ]]; then
-            log "UNHEALTHY: ${CM_NAME} RBAC check failed - dedicated-admins cannot create configmaps"
-            RBAC_CHECK_FAILED=true
-        elif [[ "${RBAC_RESULT}" != "yes" ]]; then
-            log "WARNING: ${CM_NAME} RBAC check inconclusive (connectivity issue?), skipping"
-        fi
-    else
-        log "WARNING: ${CM_NAME} could not retrieve cluster kubeconfig for RBAC check, skipping"
-    fi
-    rm -f "${RBAC_KUBECONFIG}"
-    trap - EXIT
-
-    if [[ "${RBAC_CHECK_FAILED}" == "true" ]]; then
-        if [[ "${STATUS}" != "error" ]] && ! dry_run_guard "Would mark ${CM_NAME} as error (RBAC)"; then
-            lease_oc patch configmap "${CM_NAME}" -n "${LEASE_NAMESPACE}" --type merge -p '{
-                "metadata": {
-                    "labels": { "rosa-cluster-lease/status": "error" },
-                    "annotations": { "rosa-cluster-lease/error-reason": "RBAC: dedicated-admins permissions not functional", "rosa-cluster-lease/error-at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'" }
-                }
-            }'
-        fi
-        UNHEALTHY=$((UNHEALTHY + 1))
-        echo "UNHEALTHY: ${CM_NAME} (RBAC: dedicated-admins broken)" >> "${REPORT}"
-        continue
-    fi
-
-    # PKO health check: detect ClusterPackages stuck on "refusing adoption"
-    # and repair CRD ownership labels so PKO can re-adopt.
-    PKO_KUBECONFIG=$(mktemp)
-    trap 'rm -f "${PKO_KUBECONFIG}"' EXIT
-    PKO_CHECK_FAILED=false
-    if ocm get "/api/clusters_mgmt/v1/clusters/${CLUSTER_ID}/credentials" 2>/dev/null \
-        | jq -r '.kubeconfig // empty' > "${PKO_KUBECONFIG}" 2>/dev/null \
-        && [[ -s "${PKO_KUBECONFIG}" ]]; then
-        STUCK_PKGS=$(oc get clusterpackage -l "hive.openshift.io/managed=true" \
-            -o json --kubeconfig="${PKO_KUBECONFIG}" 2>/dev/null \
-            | jq -r '.items[] | select(.status.conditions[]? | select(.type=="Progressing" and (.message // "" | contains("refusing adoption")))) | .metadata.name + "|" + (.status.conditions[] | select(.type=="Progressing") | .message)' 2>/dev/null) || true
-        if [[ -n "${STUCK_PKGS}" ]]; then
-            while IFS='|' read -r PKG_NAME PKG_MSG; do
-                [[ -z "${PKG_NAME}" ]] && continue
-                # Parse CRD name from message format: "object /<crd-name> kind:CustomResourceDefinition"
-                CRD_NAME=$(echo "${PKG_MSG}" | sed -n 's|.*object /\([^ ]*\) kind:CustomResourceDefinition.*|\1|p')
-                if [[ -z "${CRD_NAME}" ]]; then
-                    log "WARNING: ${CM_NAME} could not parse CRD name from PKO error: ${PKG_MSG}"
-                    continue
-                fi
-                # Check the CRD's instance label
-                CRD_INSTANCE=$(oc get crd "${CRD_NAME}" \
-                    -o jsonpath='{.metadata.labels.package-operator\.run/instance}' \
-                    --kubeconfig="${PKO_KUBECONFIG}" 2>/dev/null || true)
-                if [[ "${CRD_INSTANCE}" != "${PKG_NAME}" ]]; then
-                    log "Repairing CRD ${CRD_NAME} ownership: instance=${CRD_INSTANCE:-<empty>} -> ${PKG_NAME}"
-                    if dry_run_guard "Would repair CRD ${CRD_NAME} ownership for ${PKG_NAME}"; then continue; fi
-                    if ! oc patch crd "${CRD_NAME}" --type merge \
-                        -p '{"metadata":{"ownerReferences":[],"labels":{"package-operator.run/instance":"'"${PKG_NAME}"'"}}}' \
-                        --kubeconfig="${PKO_KUBECONFIG}" 2>/dev/null; then
-                        log "UNHEALTHY: ${CM_NAME} PKO CRD repair failed for ${CRD_NAME}"
-                        PKO_CHECK_FAILED=true
-                    else
-                        log "Repaired CRD ${CRD_NAME} for ClusterPackage ${PKG_NAME}"
-                    fi
-                fi
-            done <<< "${STUCK_PKGS}"
-        fi
-
-        # ClusterPackage Available check: detect any ClusterPackage with Available != True.
-        # This catches degraded CPs that the "refusing adoption" check above does not cover,
-        # matching the health check's ClusterPackage backstop stamp format.
-        if [[ "${PKO_CHECK_FAILED}" != "true" ]]; then
-            DEGRADED_CP=$(oc get clusterpackage -l "hive.openshift.io/managed=true" \
-                -o json --kubeconfig="${PKO_KUBECONFIG}" 2>/dev/null \
-                | jq -r '.items[] |
-                    select(any(.status.conditions[]?;
-                        .type == "Available" and .status == "True") | not) |
-                    .metadata.name' 2>/dev/null | head -n1) || true
-            if [[ -n "${DEGRADED_CP}" ]]; then
-                log "UNHEALTHY: ${CM_NAME} ClusterPackage ${DEGRADED_CP} has Available != True"
-                if [[ "${STATUS}" != "error" ]] && ! dry_run_guard "Would mark ${CM_NAME} as error (ClusterPackage degraded)"; then
+    # The health job owns cluster diagnosis and safe repair. Among periodic
+    # jobs, the controller alone changes lease status from the published signal.
+    case "${HEALTH_STATUS}" in
+        unhealthy)
+            log "UNHEALTHY: ${CM_NAME}: ${HEALTH_REASON}"
+            if [[ "${STATUS}" != "error" ]] && ! dry_run_guard "Would mark ${CM_NAME} as error"; then
+                HEALTH_PATCH=$(jq -nc \
+                    --arg reason "Health: ${HEALTH_REASON}" \
+                    --arg errorAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                    '{metadata:{labels:{"rosa-cluster-lease/status":"error"},annotations:{
+                        "rosa-cluster-lease/error-reason":$reason,
+                        "rosa-cluster-lease/error-at":$errorAt
+                    }}}')
+                lease_oc patch configmap "${CM_NAME}" -n "${LEASE_NAMESPACE}" --type merge -p "${HEALTH_PATCH}" || true
+            fi
+            UNHEALTHY=$((UNHEALTHY + 1))
+            echo "UNHEALTHY: ${CM_NAME} (${HEALTH_REASON})" >> "${REPORT}"
+            ;;
+        healthy)
+            if [[ "${STATUS}" == "error" ]]; then
+                log "RESTORED: ${CM_NAME} passed its cluster health check"
+                if ! dry_run_guard "Would restore ${CM_NAME} to available"; then
                     lease_oc patch configmap "${CM_NAME}" -n "${LEASE_NAMESPACE}" --type merge -p '{
                         "metadata": {
-                            "labels": { "rosa-cluster-lease/status": "error" },
-                            "annotations": { "rosa-cluster-lease/error-reason": "ClusterPackage: degraded:'"${DEGRADED_CP}"'", "rosa-cluster-lease/error-at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'" }
+                            "labels": { "rosa-cluster-lease/status": "available" },
+                            "annotations": { "rosa-cluster-lease/error-reason": "", "rosa-cluster-lease/error-at": "" }
                         }
-                    }'
+                    }' || true
                 fi
-                rm -f "${PKO_KUBECONFIG}"
-                trap - EXIT
-                UNHEALTHY=$((UNHEALTHY + 1))
-                echo "UNHEALTHY: ${CM_NAME} (ClusterPackage: degraded:${DEGRADED_CP})" >> "${REPORT}"
-                continue
+                echo "RESTORED: ${CM_NAME}" >> "${REPORT}"
+            else
+                echo "HEALTHY: ${CM_NAME} (checked ${HEALTH_CHECKED_AT})" >> "${REPORT}"
             fi
-        fi
-    else
-        log "WARNING: ${CM_NAME} could not retrieve cluster kubeconfig for PKO check, skipping"
-    fi
-    rm -f "${PKO_KUBECONFIG}"
-    trap - EXIT
-
-    if [[ "${PKO_CHECK_FAILED}" == "true" ]]; then
-        if [[ "${STATUS}" != "error" ]] && ! dry_run_guard "Would mark ${CM_NAME} as error (PKO)"; then
-            lease_oc patch configmap "${CM_NAME}" -n "${LEASE_NAMESPACE}" --type merge -p '{
-                "metadata": {
-                    "labels": { "rosa-cluster-lease/status": "error" },
-                    "annotations": { "rosa-cluster-lease/error-reason": "PKO: CRD ownership repair failed", "rosa-cluster-lease/error-at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'" }
-                }
-            }'
-        fi
-        UNHEALTHY=$((UNHEALTHY + 1))
-        echo "UNHEALTHY: ${CM_NAME} (PKO: CRD ownership repair failed)" >> "${REPORT}"
-        continue
-    fi
-
-    # Restore clusters that recovered from error
-    if [[ "${STATUS}" == "error" ]]; then
-        ERROR_REASON=$(echo "${CM}" | jq -r '.metadata.annotations["rosa-cluster-lease/error-reason"] // ""')
-        if [[ "${ERROR_REASON}" == ClusterPackage:* ]]; then
-            log "SKIPPING RESTORE: ${CM_NAME} has health-check ClusterPackage error-reason, deferring to health check for recovery"
-            echo "SKIPPED RESTORE: ${CM_NAME} (error-reason: ${ERROR_REASON})" >> "${REPORT}"
-        else
-            log "RESTORED: ${CM_NAME} is healthy again"
-            if ! dry_run_guard "Would restore ${CM_NAME} to available"; then
-                lease_oc patch configmap "${CM_NAME}" -n "${LEASE_NAMESPACE}" --type merge -p '{
-                    "metadata": {
-                        "labels": { "rosa-cluster-lease/status": "available" },
-                        "annotations": { "rosa-cluster-lease/error-reason": "", "rosa-cluster-lease/error-at": "" }
-                    }
-                }' || true
-            fi
-            echo "RESTORED: ${CM_NAME}" >> "${REPORT}"
-        fi
-    fi
-
-    HEALTHY=$((HEALTHY + 1))
+            HEALTHY=$((HEALTHY + 1))
+            ;;
+        *)
+            log "PENDING HEALTH: ${CM_NAME}: ${HEALTH_REASON:-no health result published}"
+            echo "PENDING HEALTH: ${CM_NAME} (${HEALTH_REASON:-no health result published})" >> "${REPORT}"
+            ;;
+    esac
 done
 
 # ---------------------------------------------------------------
@@ -1240,7 +1100,10 @@ for i in $(seq 0 $((FINAL_COUNT - 1))); do
     F_HOLDER=$(echo "${F_CM}" | jq -r '.metadata.annotations["rosa-cluster-lease/holder"] // ""')
     F_BUILD=$(echo "${F_CM}" | jq -r '.metadata.annotations["rosa-cluster-lease/build-id"] // ""')
     F_ACQ=$(echo "${F_CM}" | jq -r '.metadata.annotations["rosa-cluster-lease/acquired-at"] // ""')
+    F_HEALTH=$(echo "${F_CM}" | jq -r '.metadata.annotations["rosa-cluster-lease/health-status"] // "unknown"')
+    F_HEALTH_REASON=$(echo "${F_CM}" | jq -r '.metadata.annotations["rosa-cluster-lease/health-reason"] // ""')
     printf "  %-40s status=%-12s env=%-10s type=%s\n" "${F_NAME}" "${F_STATUS}" "${F_ENV}" "${F_TYPE}" >> "${REPORT}"
+    echo "    health: ${F_HEALTH}${F_HEALTH_REASON:+ (${F_HEALTH_REASON})}" >> "${REPORT}"
     [[ -n "${F_OPS}" ]] && echo "    operators: ${F_OPS}" >> "${REPORT}"
     [[ -n "${F_HOLDER}" ]] && echo "    holder: ${F_HOLDER} build=${F_BUILD} acquired=${F_ACQ}" >> "${REPORT}"
 done

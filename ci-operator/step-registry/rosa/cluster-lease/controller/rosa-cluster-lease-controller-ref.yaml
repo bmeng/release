@@ -49,11 +49,12 @@ ref:
     per-cluster ConfigMaps, and takes action:
 
     - Provisions missing clusters via rosa CLI
-    - Health checks existing clusters (OCM status, node health)
+    - Consumes health results published by rosa-cluster-lease-health
     - Recovers stale leases (in-use beyond STALE_LEASE_HOURS)
     - Refreshes aged clusters on a configured day (MAX_CLUSTER_AGE_HOURS)
     - Replaces unhealthy clusters (error beyond ERROR_REPLACE_HOURS)
     - Upgrades available clusters when desired version is newer
     - Decommissions clusters no longer in desired state
 
-    Run as a periodic Prow job (e.g. every 15 minutes).
+    Among the periodic jobs, this controller is the sole owner of lease status
+    transitions. Run as a periodic Prow job (e.g. every 15 minutes).
