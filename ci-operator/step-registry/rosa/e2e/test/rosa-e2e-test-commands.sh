@@ -63,6 +63,18 @@ export OCM_ENV="${OCM_LOGIN_ENV}"
 export CLUSTER_ID
 export AWS_REGION="${REGION:-${LEASED_RESOURCE}}"
 
+if [[ -s "${SHARED_DIR}/minimum-openshift-version" ]]; then
+  expected_version=$(head -n 1 "${SHARED_DIR}/minimum-openshift-version" | tr -d '[:space:]')
+  actual_version=$(ocm get "/api/clusters_mgmt/v1/clusters/${CLUSTER_ID}" | jq -r '.openshift_version // empty')
+  printf 'expected=%s\nactual=%s\n' "${expected_version}" "${actual_version}" \
+    >"${ARTIFACT_DIR}/minimum-version-checkpoint.txt"
+  if [[ "${actual_version}" != "${expected_version}" ]]; then
+    log "ERROR: cluster version ${actual_version:-unknown} does not match discovered minimum ${expected_version}"
+    exit 1
+  fi
+  log "Minimum-version checkpoint passed: cluster is running ${actual_version}"
+fi
+
 # Try to get management cluster access via OCM API
 log "Attempting management cluster access..."
 MC_NAME=$(ocm get /api/clusters_mgmt/v1/clusters/"${CLUSTER_ID}"/hypershift 2>/dev/null | jq -r '.management_cluster // empty') || true

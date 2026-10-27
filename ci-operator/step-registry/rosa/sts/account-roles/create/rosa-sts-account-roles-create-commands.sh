@@ -13,6 +13,20 @@ CHANNEL_GROUP=${CHANNEL_GROUP}
 PERMISSIONS_BOUNDARY=${PERMISSIONS_BOUNDARY:-}
 ACCOUNT_ROLES_PREFIX=$(head -n 1 "${SHARED_DIR}/cluster-prefix")
 
+if [[ -s "${SHARED_DIR}/minimum-openshift-version" ]]; then
+  DISCOVERED_OPENSHIFT_VERSION=$(head -n 1 "${SHARED_DIR}/minimum-openshift-version" | tr -d '[:space:]')
+  if [[ ! "${DISCOVERED_OPENSHIFT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "Discovered minimum OpenShift version is invalid"
+    exit 1
+  fi
+  if [[ -n "${OPENSHIFT_VERSION}" && "${OPENSHIFT_VERSION}" != "${DISCOVERED_OPENSHIFT_VERSION}" ]]; then
+    echo "Configured version ${OPENSHIFT_VERSION} does not match discovered minimum ${DISCOVERED_OPENSHIFT_VERSION}"
+    exit 1
+  fi
+  OPENSHIFT_VERSION="${DISCOVERED_OPENSHIFT_VERSION}"
+  echo "Using discovered minimum OpenShift version ${OPENSHIFT_VERSION}"
+fi
+
 # Configure aws
 AWSCRED="${CLUSTER_PROFILE_DIR}/.awscred"
 if [[ -f "${AWSCRED}" ]]; then
@@ -86,8 +100,8 @@ if [[ -z "$OPENSHIFT_VERSION" ]]; then
 fi
 
 if [[ -n "$OPENSHIFT_VERSION" ]]; then
-  OPENSHIFT_VERSION=$(echo "${OPENSHIFT_VERSION}" | cut -d '.' -f 1,2)
-  VERSION_SWITCH="--version ${OPENSHIFT_VERSION} --channel-group ${CHANNEL_GROUP}"
+  ACCOUNT_ROLES_VERSION=$(echo "${OPENSHIFT_VERSION}" | cut -d '.' -f 1,2)
+  VERSION_SWITCH="--version ${ACCOUNT_ROLES_VERSION} --channel-group ${CHANNEL_GROUP}"
 fi
 
 ARN_PATH_SWITCH=""
