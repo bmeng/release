@@ -8,7 +8,7 @@ ref:
       cpu: 100m
       memory: 100Mi
   dependencies:
-  - name: hypershift-operator
+  - name: hypershift-operator-pr
     env: OPERATOR_IMAGE
   env:
   - name: OCM_LOGIN_ENV
