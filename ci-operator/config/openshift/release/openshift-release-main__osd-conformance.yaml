@@ -8,7 +8,7 @@ releases:
     release:
       architecture: amd64
       channel: candidate
-      version: "4.20"
+      version: "4.22"
 resources:
   '*':
     limits:
@@ -20,11 +20,12 @@ tests:
 - as: aws-k8s-conformance
   cron: 0 8 1 * *
   steps:
-    cluster_profile: aws-sd-qe
+    cluster_profile: rosa-e2e-01
     env:
       CHANNEL_GROUP: stable
       COMPUTE_NODES: "6"
       OPENSHIFT_VERSION: ""
+      REGION: us-west-2
     workflow: osd-ccs-aws-k8s-conformance
 zz_generated_metadata:
   branch: main
